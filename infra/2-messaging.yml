@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SNS topic FIFO ticket-events com 4 SQS FIFO em High Throughput Mode e payload-based filter na vip queue
+
+Resources:
+  # ============================================================================
+  # SQS FIFO em High Throughput Mode. DeduplicationScope=messageGroup +
+  # FifoThroughputLimit=perMessageGroupId habilita ate 9.000 msg/s por
+  # MessageGroupId (showId), em vez de 300 msg/s no FIFO padrao.
+  # ContentBasedDeduplication=true calcula SHA-256 do payload e usa como
+  # dedup id, util para garantir descarte de duplicata mesmo em hops onde
+  # o cliente nao passa MessageDeduplicationId explicito.
+  # VisibilityTimeout=60s cobre o processamento real (sub segundo) com folga.
+  # Long polling de 20s no consumer reduz chamadas vazias.
+  # ============================================================================
+  ReservationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: sqs-poc-reservation-queue.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      DeduplicationScope: messageGroup
+      FifoThroughputLimit: perMessageGroupId
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+
+  NotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: sqs-poc-notification-queue.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      DeduplicationScope: messageGroup
+      FifoThroughputLimit: perMessageGroupId
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+
+  FulfillmentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: sqs-poc-fulfillment-queue.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      DeduplicationScope: messageGroup
+      FifoThroughputLimit: perMessageGroupId
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+
+  VipQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: sqs-poc-vip-queue.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      DeduplicationScope: messageGroup
+      FifoThroughputLimit: perMessageGroupId
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+
+  # ============================================================================
+  # Topico SNS FIFO. ContentBasedDeduplication=true espelha o atributo das
+  # filas, garantindo dedup automatica quando o publisher nao passa o id
+  # explicito. A reservation-queue.fifo NAO assina este topico, ela e
+  # alimentada direto pelo ingestor. O fan-out comeca quando o
+  # reservation-handler publica TicketReservedEvent neste topico.
+  # ============================================================================
+  TicketEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: sns-poc-ticket-events.fifo
+      FifoTopic: true
+      ContentBasedDeduplication: true
+
+  # ============================================================================
+  # Subscriptions SNS FIFO -> SQS FIFO. RawMessageDelivery=true entrega o
+  # payload puro nas filas, sem o envelope SNS, para que o @SqsListener
+  # desserialize direto em TicketReservedEvent. A subscription do vip
+  # aplica payload-based filtering com FilterPolicyScope=MessageBody,
+  # recebendo apenas reservas com ticketTier IN [VIP, CAMAROTE]. As outras
+  # 2 subscriptions recebem todas as mensagens publicadas.
+  # ============================================================================
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref TicketEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt NotificationQueue.Arn
+      RawMessageDelivery: 'true'
+
+  FulfillmentSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref TicketEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt FulfillmentQueue.Arn
+      RawMessageDelivery: 'true'
+
+  VipSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref TicketEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt VipQueue.Arn
+      RawMessageDelivery: 'true'
+      FilterPolicy: '{"ticketTier":["VIP","CAMAROTE"]}'
+      FilterPolicyScope: MessageBody
+
+  # ============================================================================
+  # Queue Policies que liberam o SNS topic FIFO a entregar mensagens nas
+  # filas assinantes (notification, fulfillment, vip). Sem essas policies o
+  # SNS recebe AccessDenied no SendMessage para a fila. A reservation-queue
+  # nao precisa de QueuePolicy porque nao e assinante do topic.
+  # ============================================================================
+  NotificationQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref NotificationQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt NotificationQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref TicketEventsTopic
+
+  FulfillmentQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref FulfillmentQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt FulfillmentQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref TicketEventsTopic
+
+  VipQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref VipQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt VipQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref TicketEventsTopic
+
+Outputs:
+  TicketEventsTopicArn:
+    Description: ARN do topico SNS FIFO ticket-events
+    Value: !Ref TicketEventsTopic
+  TicketEventsTopicName:
+    Description: Nome do topico SNS FIFO ticket-events
+    Value: !GetAtt TicketEventsTopic.TopicName
+  ReservationQueueName:
+    Description: Nome da reservation-queue.fifo
+    Value: !GetAtt ReservationQueue.QueueName
+  ReservationQueueArn:
+    Description: ARN da reservation-queue.fifo
+    Value: !GetAtt ReservationQueue.Arn
+  ReservationQueueUrl:
+    Description: URL da reservation-queue.fifo
+    Value: !Ref ReservationQueue
+  NotificationQueueName:
+    Description: Nome da notification-queue.fifo
+    Value: !GetAtt NotificationQueue.QueueName
+  NotificationQueueArn:
+    Description: ARN da notification-queue.fifo
+    Value: !GetAtt NotificationQueue.Arn
+  NotificationQueueUrl:
+    Description: URL da notification-queue.fifo
+    Value: !Ref NotificationQueue
+  FulfillmentQueueName:
+    Description: Nome da fulfillment-queue.fifo
+    Value: !GetAtt FulfillmentQueue.QueueName
+  FulfillmentQueueArn:
+    Description: ARN da fulfillment-queue.fifo
+    Value: !GetAtt FulfillmentQueue.Arn
+  FulfillmentQueueUrl:
+    Description: URL da fulfillment-queue.fifo
+    Value: !Ref FulfillmentQueue
+  VipQueueName:
+    Description: Nome da vip-queue.fifo
+    Value: !GetAtt VipQueue.QueueName
+  VipQueueArn:
+    Description: ARN da vip-queue.fifo
+    Value: !GetAtt VipQueue.Arn
+  VipQueueUrl:
+    Description: URL da vip-queue.fifo
+    Value: !Ref VipQueue

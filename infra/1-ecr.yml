@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECR Repositories para distribuindo-eventos-com-aws-sns-sqs (ingestor, reservation-handler, notification, fulfillment, vip-handler)
+
+Resources:
+  IngestorRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ms-poc-ingestor
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 1 day",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 1 },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep last 5 tagged images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 5 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  ReservationHandlerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ms-poc-reservation-handler
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 1 day",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 1 },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep last 5 tagged images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 5 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  NotificationRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ms-poc-notification
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 1 day",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 1 },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep last 5 tagged images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 5 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  FulfillmentRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ms-poc-fulfillment
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 1 day",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 1 },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep last 5 tagged images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 5 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  VipHandlerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ms-poc-vip-handler
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 1 day",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 1 },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep last 5 tagged images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 5 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+Outputs:
+  AccountId:
+    Description: AWS Account ID
+    Value: !Ref AWS::AccountId
+  IngestorRepositoryName:
+    Description: Nome do repositorio ECR do ingestor
+    Value: !Ref IngestorRepository
+  IngestorRepositoryUri:
+    Description: URI do repositorio ECR do ingestor
+    Value: !GetAtt IngestorRepository.RepositoryUri
+  ReservationHandlerRepositoryName:
+    Description: Nome do repositorio ECR do reservation-handler
+    Value: !Ref ReservationHandlerRepository
+  ReservationHandlerRepositoryUri:
+    Description: URI do repositorio ECR do reservation-handler
+    Value: !GetAtt ReservationHandlerRepository.RepositoryUri
+  NotificationRepositoryName:
+    Description: Nome do repositorio ECR do notification
+    Value: !Ref NotificationRepository
+  NotificationRepositoryUri:
+    Description: URI do repositorio ECR do notification
+    Value: !GetAtt NotificationRepository.RepositoryUri
+  FulfillmentRepositoryName:
+    Description: Nome do repositorio ECR do fulfillment
+    Value: !Ref FulfillmentRepository
+  FulfillmentRepositoryUri:
+    Description: URI do repositorio ECR do fulfillment
+    Value: !GetAtt FulfillmentRepository.RepositoryUri
+  VipHandlerRepositoryName:
+    Description: Nome do repositorio ECR do vip-handler
+    Value: !Ref VipHandlerRepository
+  VipHandlerRepositoryUri:
+    Description: URI do repositorio ECR do vip-handler
+    Value: !GetAtt VipHandlerRepository.RepositoryUri

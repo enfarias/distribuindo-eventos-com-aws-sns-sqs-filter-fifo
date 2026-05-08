@@ -1,0 +1,771 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECS Fargate para distribuindo-eventos-com-aws-sns-sqs (5 services, ALB com 2 target groups e path routing /api/reservations e /api/notifications)
+
+Parameters:
+  IngestorImageUri:
+    Type: String
+    Description: "URI completa da imagem do ms-payment-ingestor (ex: ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/ms-poc-ingestor:latest)"
+  ReservationHandlerImageUri:
+    Type: String
+    Description: URI completa da imagem do ms-reservation-handler
+  NotificationImageUri:
+    Type: String
+    Description: URI completa da imagem do ms-notification
+  FulfillmentImageUri:
+    Type: String
+    Description: URI completa da imagem do ms-fulfillment
+  VipHandlerImageUri:
+    Type: String
+    Description: URI completa da imagem do ms-vip-handler
+  ReservationQueueName:
+    Type: String
+    Description: Nome da reservation-queue.fifo (output da stack messaging)
+  ReservationQueueArn:
+    Type: String
+    Description: ARN da reservation-queue.fifo
+  NotificationQueueName:
+    Type: String
+    Description: Nome da notification-queue.fifo
+  NotificationQueueArn:
+    Type: String
+    Description: ARN da notification-queue.fifo
+  FulfillmentQueueName:
+    Type: String
+    Description: Nome da fulfillment-queue.fifo
+  FulfillmentQueueArn:
+    Type: String
+    Description: ARN da fulfillment-queue.fifo
+  VipQueueName:
+    Type: String
+    Description: Nome da vip-queue.fifo
+  VipQueueArn:
+    Type: String
+    Description: ARN da vip-queue.fifo
+  TicketEventsTopicArn:
+    Type: String
+    Description: ARN do topico SNS FIFO ticket-events
+  TicketEventsTopicName:
+    Type: String
+    Description: Nome do topico SNS FIFO ticket-events
+
+Resources:
+  # === VPC e Networking ===
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: vpc-poc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: igw-poc
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: us-east-1a
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: subnet-poc-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: us-east-1b
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: subnet-poc-b
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: rt-poc-public
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # === Security Groups ===
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: alb-poc-sg
+      GroupDescription: Permite HTTP publico para o ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  IngestorTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ms-poc-ingestor-sg
+      GroupDescription: Tasks do ingestor aceitam 8081 apenas do ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  ReservationHandlerTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ms-poc-reservation-handler-sg
+      GroupDescription: Tasks do reservation-handler, somente egress (SQS, SNS)
+      VpcId: !Ref Vpc
+
+  NotificationTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ms-poc-notification-sg
+      GroupDescription: Tasks do notification aceitam 8083 apenas do ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8083
+          ToPort: 8083
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  FulfillmentTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ms-poc-fulfillment-sg
+      GroupDescription: Tasks do fulfillment, somente egress
+      VpcId: !Ref Vpc
+
+  VipHandlerTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ms-poc-vip-handler-sg
+      GroupDescription: Tasks do vip-handler, somente egress
+      VpcId: !Ref Vpc
+
+  # === Application Load Balancer (ingestor + notification) ===
+  PublicAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Name: alb-poc
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '600'
+
+  IngestorTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: ms-poc-ingestor-tg
+      VpcId: !Ref Vpc
+      Port: 8081
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+
+  NotificationTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: ms-poc-notification-tg
+      VpcId: !Ref Vpc
+      Port: 8083
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '15'
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+
+  PublicListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref PublicAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '404'
+            ContentType: text/plain
+            MessageBody: 'rota nao registrada neste ALB'
+
+  IngestorListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref PublicListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/reservations/*
+            - /api/reservations
+            - /actuator/health
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref IngestorTargetGroup
+
+  NotificationListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref PublicListener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/notifications/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref NotificationTargetGroup
+
+  # === CloudWatch Log Groups ===
+  IngestorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/ms-poc-ingestor
+      RetentionInDays: 7
+
+  ReservationHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/ms-poc-reservation-handler
+      RetentionInDays: 7
+
+  NotificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/ms-poc-notification
+      RetentionInDays: 7
+
+  FulfillmentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/ms-poc-fulfillment
+      RetentionInDays: 7
+
+  VipHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/ms-poc-vip-handler
+      RetentionInDays: 7
+
+  # === IAM Roles ===
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ecs-poc-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  IngestorTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ms-poc-ingestor-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IngestorSqsWriteOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueUrl
+                  - sqs:GetQueueAttributes
+                Resource: !Ref ReservationQueueArn
+
+  ReservationHandlerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ms-poc-reservation-handler-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReservationHandlerSqsConsume
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource: !Ref ReservationQueueArn
+        - PolicyName: ReservationHandlerSnsPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - sns:GetTopicAttributes
+                  - sns:CreateTopic
+                Resource: !Ref TicketEventsTopicArn
+
+  NotificationTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ms-poc-notification-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: NotificationSqsConsume
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource: !Ref NotificationQueueArn
+
+  FulfillmentTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ms-poc-fulfillment-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FulfillmentSqsConsume
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource: !Ref FulfillmentQueueArn
+
+  VipHandlerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ms-poc-vip-handler-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: VipHandlerSqsConsume
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource: !Ref VipQueueArn
+
+  # === ECS Cluster ===
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: ecs-poc-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enhanced
+
+  # === Task Definitions ===
+  IngestorTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: ms-poc-ingestor
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt IngestorTaskRole.Arn
+      ContainerDefinitions:
+        - Name: ingestor
+          Image: !Ref IngestorImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8081
+              Protocol: tcp
+          Environment:
+            - Name: RESERVATION_QUEUE_NAME
+              Value: !Ref ReservationQueueName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref IngestorLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ReservationHandlerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: ms-poc-reservation-handler
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ReservationHandlerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: reservation-handler
+          Image: !Ref ReservationHandlerImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8082
+              Protocol: tcp
+          Environment:
+            - Name: RESERVATION_QUEUE_NAME
+              Value: !Ref ReservationQueueName
+            - Name: TICKET_EVENTS_TOPIC
+              Value: !Ref TicketEventsTopicName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: SQS_WAIT_TIME_SECONDS
+              Value: '20'
+            - Name: SQS_MAX_MESSAGES_PER_POLL
+              Value: '10'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ReservationHandlerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  NotificationTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: ms-poc-notification
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt NotificationTaskRole.Arn
+      ContainerDefinitions:
+        - Name: notification
+          Image: !Ref NotificationImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8083
+              Protocol: tcp
+          Environment:
+            - Name: NOTIFICATION_QUEUE_NAME
+              Value: !Ref NotificationQueueName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: SQS_WAIT_TIME_SECONDS
+              Value: '20'
+            - Name: SQS_MAX_MESSAGES_PER_POLL
+              Value: '10'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref NotificationLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  FulfillmentTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: ms-poc-fulfillment
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt FulfillmentTaskRole.Arn
+      ContainerDefinitions:
+        - Name: fulfillment
+          Image: !Ref FulfillmentImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8084
+              Protocol: tcp
+          Environment:
+            - Name: FULFILLMENT_QUEUE_NAME
+              Value: !Ref FulfillmentQueueName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: SQS_WAIT_TIME_SECONDS
+              Value: '20'
+            - Name: SQS_MAX_MESSAGES_PER_POLL
+              Value: '10'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FulfillmentLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  VipHandlerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: ms-poc-vip-handler
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt VipHandlerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: vip-handler
+          Image: !Ref VipHandlerImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8085
+              Protocol: tcp
+          Environment:
+            - Name: VIP_QUEUE_NAME
+              Value: !Ref VipQueueName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: SQS_WAIT_TIME_SECONDS
+              Value: '20'
+            - Name: SQS_MAX_MESSAGES_PER_POLL
+              Value: '10'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref VipHandlerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # === ECS Services ===
+  IngestorService:
+    Type: AWS::ECS::Service
+    DependsOn: IngestorListenerRule
+    Properties:
+      ServiceName: ms-poc-ingestor
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref IngestorTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref IngestorTaskSecurityGroup
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+      LoadBalancers:
+        - ContainerName: ingestor
+          ContainerPort: 8081
+          TargetGroupArn: !Ref IngestorTargetGroup
+
+  ReservationHandlerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: ms-poc-reservation-handler
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref ReservationHandlerTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ReservationHandlerTaskSecurityGroup
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+
+  NotificationService:
+    Type: AWS::ECS::Service
+    DependsOn: NotificationListenerRule
+    Properties:
+      ServiceName: ms-poc-notification
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref NotificationTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref NotificationTaskSecurityGroup
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+      LoadBalancers:
+        - ContainerName: notification
+          ContainerPort: 8083
+          TargetGroupArn: !Ref NotificationTargetGroup
+
+  FulfillmentService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: ms-poc-fulfillment
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref FulfillmentTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref FulfillmentTaskSecurityGroup
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+
+  VipHandlerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: ms-poc-vip-handler
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref VipHandlerTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref VipHandlerTaskSecurityGroup
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+
+Outputs:
+  LoadBalancerUrl:
+    Description: URL publica do ALB (rota /api/reservations/* para o ingestor)
+    Value: !Sub http://${PublicAlb.DNSName}
+  NotificationStreamUrl:
+    Description: URL base do stream SSE do notification (path /api/notifications/stream/{reservationId})
+    Value: !Sub http://${PublicAlb.DNSName}/api/notifications/stream
+  EcsClusterName:
+    Description: Nome do cluster ECS
+    Value: !Ref EcsCluster
+  IngestorServiceName:
+    Description: Nome do service do ingestor
+    Value: !GetAtt IngestorService.Name
+  ReservationHandlerServiceName:
+    Description: Nome do service do reservation-handler
+    Value: !GetAtt ReservationHandlerService.Name
+  NotificationServiceName:
+    Description: Nome do service do notification
+    Value: !GetAtt NotificationService.Name
+  FulfillmentServiceName:
+    Description: Nome do service do fulfillment
+    Value: !GetAtt FulfillmentService.Name
+  VipHandlerServiceName:
+    Description: Nome do service do vip-handler
+    Value: !GetAtt VipHandlerService.Name
+  IngestorLogGroupName:
+    Description: Nome do log group do ingestor
+    Value: !Ref IngestorLogGroup
+  ReservationHandlerLogGroupName:
+    Description: Nome do log group do reservation-handler
+    Value: !Ref ReservationHandlerLogGroup
+  NotificationLogGroupName:
+    Description: Nome do log group do notification
+    Value: !Ref NotificationLogGroup
+  FulfillmentLogGroupName:
+    Description: Nome do log group do fulfillment
+    Value: !Ref FulfillmentLogGroup
+  VipHandlerLogGroupName:
+    Description: Nome do log group do vip-handler
+    Value: !Ref VipHandlerLogGroup
